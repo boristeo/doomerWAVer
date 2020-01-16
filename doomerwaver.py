@@ -10,14 +10,23 @@ import av
 from unidecode import unidecode
 from http import HTTPStatus
 import mimetypes
+import time
 
 
+cache = {}
+
+class CacheEntry:
+  def __init__(self, streamurl, title, in_file):
+    self.time = time.time()
+    self.streamurl = streamurl
+    self.title = title
+    self.file = in_file
 
 def application(env, start_response):
   """Main wsgi entry point"""
 
   # CONSTANTS
-  GET_dir = 'client/dist'
+  GET_dir = ''
   GET_chunk_size = 4096
 
   MAX_VID_LEN_S = 60 * 30
@@ -49,7 +58,18 @@ def application(env, start_response):
 
   try:
     method = env['REQUEST_METHOD']  # Should never fail according to PEP
-    if method == 'POST':
+
+    yturl = None
+    if method == 'GET':
+      url = env.get('PATH_INFO', '/').lstrip('/')
+      if len(url) == 0 or url == 'index.html':
+        query = env.get('QUERY_STRING', None)
+        if query:
+          yturl = parse_qs(query).get('yturl', None)
+          if yturl:
+            yturl = yturl[0]
+
+    elif method == 'POST':
       # Extracting the necessary POST argument(s) 
       request_body_size = int(env.get('CONTENT_LENGTH', 0))
       args = parse_qs(env['wsgi.input'].read(request_body_size))
@@ -57,21 +77,37 @@ def application(env, start_response):
       if not yturl:
         yield fail(HTTPStatus.BAD_REQUEST, 'POST request must have a yturl paramter containing the Youtube url')
         return
+      yturl = yturl[0].decode('utf-8')
 
-      # Request good. Attempt to find video
-      video = find_video(yturl[0].decode('utf-8'))
-      if not video:
-        yield fail(HTTPStatus.BAD_REQUEST, 'Youtube link was not valid')
-        return
-      if video.length > MAX_VID_LEN_S:
-        yield fail(HTTPStatus.BAD_REQUEST, 'Videos over %d seconds long are not currently supported' % MAX_VID_LEN_S)
-        return
+    if yturl:
+      print('Requested', yturl)
+      cached = cache.get(yturl, None)
+      if cached:
+        print('Found cache entry from %s' % cached.time)
+        streamurl = cached.streamurl
+        title = cached.title
+        in_file = cached.file or av.open(streamurl, options={'rtsp_transport': 'tcp'})
+      else:
+        # Request good. Attempt to find video
+        video = find_video(yturl)
+        if not video:
+          yield fail(HTTPStatus.BAD_REQUEST, 'Youtube link was not valid')
+          return
+        if video.length > MAX_VID_LEN_S:
+          yield fail(HTTPStatus.BAD_REQUEST, 'Videos over %d seconds long are not currently supported' % MAX_VID_LEN_S)
+          return
 
-      # Video found and valid. Getting audio stream and forwarding to you
-      astream = video.getbestaudio(preftype='webm')
-      start_response(smsg(HTTPStatus.OK), data_headers(video.title))
-      for frame in stream_doom(astream.url):
+        # Video found and valid. Getting audio stream and forwarding to you
+        astream = video.getbestaudio(preftype='webm')
+        streamurl = astream.url
+        title = video.title
+        in_file = av.open(streamurl, options={'rtsp_transport': 'tcp'})
+        cache[yturl] = CacheEntry(streamurl, title, in_file)
+
+      start_response(smsg(HTTPStatus.OK), data_headers(title))
+      for frame in stream_doom(in_file):
         yield frame
+      cache[yturl].file = None
       return
       
 
@@ -112,10 +148,9 @@ def find_video(yturl: str):
     return None
 
 
-def stream_doom(yturl: str, speed=None, noise=None):
+def stream_doom(in_file, speed=None, noise=None):
   """ Returns a generator of doomified mp3 frames """
 
-  in_file = av.open(yturl, options={'rtsp_transport': 'tcp'})
   in_stream = in_file.streams.audio[0]
   in_codec = in_stream.codec_context
 
@@ -139,6 +174,7 @@ def stream_doom(yturl: str, speed=None, noise=None):
     raise Exception('Too many audio channels in stream')
 
   noise = noise or 0.1
+  noise_ratio = int(1 / noise)
   wet = 1 - noise
 
   def moving_average(a, n=3):
@@ -148,7 +184,7 @@ def stream_doom(yturl: str, speed=None, noise=None):
 
   with wave.open(nf, 'rb') as vinyl:
     vinbuf = vinyl.readframes(int(out_codec.rate * 1.5))
-    b = np.frombuffer(vinbuf, dtype='i2').reshape((1, -1))
+    b = np.floor_divide(np.frombuffer(vinbuf, dtype='i2'), noise_ratio).reshape((1, -1))
     newframe = av.audio.frame.AudioFrame.from_ndarray(b, format='s16', layout=in_codec.layout.name)
     newframe.rate = out_codec.rate
     for p in out_codec.encode(newframe):
