@@ -2,5 +2,5 @@ av==6.2.0
 numpy==1.18.0
 pafy==0.5.5
 Unidecode==1.1.1
-urllib3==1.25.7
+urllib3==1.26.5
 youtube-dl==2020.1.1
